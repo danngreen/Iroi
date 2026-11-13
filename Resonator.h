@@ -194,6 +194,8 @@ private:
     float range_;
     float tune_;
     float oldTuning_;
+    float tuningInc_ = 0.f;
+    float volInc_ = 0.f;
     int ranges_[3];
 
     int task_;
@@ -347,6 +349,63 @@ public:
         delete obj;
     }
 
+    // Control-rate work: call once per block of `size` samples, before processSample()
+    void prepare(size_t size)
+    {
+        SetDissonance(patchCtrls_->resonatorDissonance);
+
+        // Tuning and volume ramp to their new values over the block
+        float t = Modulate(patchCtrls_->resonatorTune, patchCtrls_->resonatorTuneModAmount, patchState_->modValue, patchCtrls_->resonatorTuneCvAmount, patchCvs_->resonatorTune, -1.f, 1.f, patchState_->modAttenuverters, patchState_->cvAttenuverters);
+        tuningInc_ = (t - oldTuning_) / static_cast<float>(size);
+
+        float f = Modulate(patchCtrls_->resonatorFeedback, patchCtrls_->resonatorFeedbackModAmount, patchState_->modValue, patchCtrls_->resonatorFeedbackCvAmount, patchCvs_->resonatorFeedback, -1.f, 1.f, patchState_->modAttenuverters, patchState_->cvAttenuverters);
+        SetFeedback(f);
+
+        volInc_ = (patchCtrls_->resonatorVol - dryWet_) / static_cast<float>(size);
+    }
+
+    // One stereo sample, in place
+    inline void processSample(float &leftIO, float &rightIO)
+    {
+        oldTuning_ += tuningInc_;
+        SetTune(oldTuning_);
+
+        float lIn = Clamp(leftIO, -3.f, 3.f);
+        float rIn = Clamp(rightIO, -3.f, 3.f);
+
+        float left = poles_[1]->Process(lIn, LEFT_CHANNEL);
+        float right = poles_[2]->Process(rIn, RIGHT_CHANNEL);
+
+        float oLeft = left * 0.75f + right * 0.25f;
+        float oRight = left * 0.25f + right * 0.75f;
+
+        left = 0;
+        right = 0;
+        poles_[0]->Process(lIn, rIn, left, right);
+        oLeft += left;
+        oRight += right;
+
+        oLeft *= 1.f - ef_[LEFT_CHANNEL]->process(oLeft);
+        oRight *= 1.f - ef_[RIGHT_CHANNEL]->process(oRight);
+
+        oLeft *= amp_;
+        oRight *= amp_;
+
+        oLeft = notches_[LEFT_CHANNEL]->process(oLeft);
+        oRight = notches_[RIGHT_CHANNEL]->process(oRight);
+
+        oLeft = hs_[LEFT_CHANNEL]->process(oLeft);
+        oRight = hs_[RIGHT_CHANNEL]->process(oRight);
+
+        dryWet_ += volInc_;
+        float v = dryWet_;
+
+        leftIO = CheapEqualPowerCrossFade(lIn, oLeft * kResoMakeupGain, v);
+        rightIO = CheapEqualPowerCrossFade(rIn, oRight * kResoMakeupGain, v);
+
+        compressor_->processStereo(leftIO, rightIO);
+    }
+
     void process(AudioBuffer &input, AudioBuffer &output)
     {
         size_t size = output.getSize();
@@ -355,53 +414,15 @@ public:
         FloatArray leftOut = output.getSamples(LEFT_CHANNEL);
         FloatArray rightOut = output.getSamples(RIGHT_CHANNEL);
 
-        SetDissonance(patchCtrls_->resonatorDissonance);
-
-        float t = Modulate(patchCtrls_->resonatorTune, patchCtrls_->resonatorTuneModAmount, patchState_->modValue, patchCtrls_->resonatorTuneCvAmount, patchCvs_->resonatorTune, -1.f, 1.f, patchState_->modAttenuverters, patchState_->cvAttenuverters);
-        ParameterInterpolator tuningParam(&oldTuning_, t, size);
-
-        float f = Modulate(patchCtrls_->resonatorFeedback, patchCtrls_->resonatorFeedbackModAmount, patchState_->modValue, patchCtrls_->resonatorFeedbackCvAmount, patchCvs_->resonatorFeedback, -1.f, 1.f, patchState_->modAttenuverters, patchState_->cvAttenuverters);
-        SetFeedback(f);
-
-        ParameterInterpolator volParam = ParameterInterpolator(&dryWet_, patchCtrls_->resonatorVol, size);
+        prepare(size);
 
         for (size_t i = 0; i < size; i++)
         {
-            SetTune(tuningParam.Next());
-
-            float lIn = Clamp(leftIn[i], -3.f, 3.f);
-            float rIn = Clamp(rightIn[i], -3.f, 3.f);
-
-            float left = poles_[1]->Process(lIn, LEFT_CHANNEL);
-            float right = poles_[2]->Process(rIn, RIGHT_CHANNEL);
-
-            float oLeft = left * 0.75f + right * 0.25f;
-            float oRight = left * 0.25f + right * 0.75f;
-
-            left = 0;
-            right = 0;
-            poles_[0]->Process(lIn, rIn, left, right);
-            oLeft += left;
-            oRight += right;
-
-            oLeft *= 1.f - ef_[LEFT_CHANNEL]->process(oLeft);
-            oRight *= 1.f - ef_[RIGHT_CHANNEL]->process(oRight);
-
-            oLeft *= amp_;
-            oRight *= amp_;
-
-            oLeft = notches_[LEFT_CHANNEL]->process(oLeft);
-            oRight = notches_[RIGHT_CHANNEL]->process(oRight);
-
-            oLeft = hs_[LEFT_CHANNEL]->process(oLeft);
-            oRight = hs_[RIGHT_CHANNEL]->process(oRight);
-
-            float v = volParam.Next();
-
-            leftOut[i] = CheapEqualPowerCrossFade(lIn, oLeft * kResoMakeupGain, v);
-            rightOut[i] = CheapEqualPowerCrossFade(rIn, oRight * kResoMakeupGain, v);
+            float left = leftIn[i];
+            float right = rightIn[i];
+            processSample(left, right);
+            leftOut[i] = left;
+            rightOut[i] = right;
         }
-
-        compressor_->process(output, output);
     }
 };

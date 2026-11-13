@@ -104,6 +104,31 @@ public:
         return input * leftCv;
     }
 
+    // One stereo sample, in place
+    inline void processStereo(float &left, float &right)
+    {
+        // Detector (peak)
+        float leftSideInput = abs(left);
+        float rightSideInput = abs(right);
+
+        // Ballistics filter and envelope generation
+        float leftCte = (leftSideInput >= leftS1_ ? cteAT_ : cteRL_);
+        float leftEnv = leftSideInput + leftCte * (leftS1_ - leftSideInput);
+        leftS1_ = leftEnv;
+
+        float rightCte = (rightSideInput >= rightS1_ ? cteAT_ : cteRL_);
+        float rightEnv = rightSideInput + rightCte * (rightS1_ - rightSideInput);
+        rightS1_ = rightEnv;
+
+        // Compressor transfer function
+        float leftCv = (leftEnv <= thrlin_ ? 1.f : fast_powf(leftEnv / thrlin_, expo_));
+        float rightCv = (rightEnv <= thrlin_ ? 1.f : fast_powf(rightEnv / thrlin_, expo_));
+
+        // Processing
+        left *= leftCv;
+        right *= rightCv;
+    }
+
     void process(AudioBuffer &input, AudioBuffer &output)
     {
         int size = input.getSize();
@@ -114,26 +139,11 @@ public:
 
         for (int i = 0; i < size; i++)
         {
-            // Detector (peak)
-            float leftSideInput = abs(leftIn[i]);
-            float rightSideInput = abs(rightIn[i]);
-
-            // Ballistics filter and envelope generation
-            float leftCte = (leftSideInput >= leftS1_ ? cteAT_ : cteRL_);
-            float leftEnv = leftSideInput + leftCte * (leftS1_ - leftSideInput);
-            leftS1_ = leftEnv;
-
-            float rightCte = (rightSideInput >= rightS1_ ? cteAT_ : cteRL_);
-            float rightEnv = rightSideInput + rightCte * (rightS1_ - rightSideInput);
-            rightS1_ = rightEnv;
-
-            // Compressor transfer function
-            float leftCv = (leftEnv <= thrlin_ ? 1.f : fast_powf(leftEnv / thrlin_, expo_));
-            float rightCv = (rightEnv <= thrlin_ ? 1.f : fast_powf(rightEnv / thrlin_, expo_));
-
-            // Processing
-            leftOut[i] = leftIn[i] * leftCv;
-            rightOut[i] = rightIn[i] * rightCv;
+            float left = leftIn[i];
+            float right = rightIn[i];
+            processStereo(left, right);
+            leftOut[i] = left;
+            rightOut[i] = right;
         }
     }
 };

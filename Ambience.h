@@ -326,6 +326,11 @@ private:
     float amp_, pan_, decay_, spaceTime_, dryWet_;
     float reverse_;
     float xi_;
+
+    // Per-block state, set by prepare()
+    float forward_ = 1.f;
+    float x_ = 0.f;
+    float volInc_ = 0.f;
     const int32_t kAmbienceBufferSize;
 
     Lut<float, 32> decayLUT{0.f, -200.f, Lut<float, 32>::Type::LUT_TYPE_EXPO};
@@ -497,14 +502,9 @@ public:
         delete obj;
     }
 
-    void process(AudioBuffer &input, AudioBuffer &output)
+    // Control-rate work: call once per block of `size` samples, before processSample()
+    void prepare(size_t size)
     {
-        size_t size = output.getSize();
-        FloatArray leftIn = input.getSamples(LEFT_CHANNEL);
-        FloatArray rightIn = input.getSamples(RIGHT_CHANNEL);
-        FloatArray leftOut = output.getSamples(LEFT_CHANNEL);
-        FloatArray rightOut = output.getSamples(RIGHT_CHANNEL);
-
         SetPan(patchCtrls_->ambienceAutoPan);
 
         float d = Modulate(patchCtrls_->ambienceDecay, patchCtrls_->ambienceDecayModAmount, patchState_->modValue, patchCtrls_->ambienceDecayCvAmount, patchCvs_->ambienceDecay, -1.f, 1.f, patchState_->modAttenuverters, patchState_->cvAttenuverters);
@@ -513,51 +513,82 @@ public:
         float t = Modulate(patchCtrls_->ambienceSpacetime, patchCtrls_->ambienceSpacetimeModAmount, patchState_->modValue, patchCtrls_->ambienceSpacetimeCvAmount, patchCvs_->ambienceSpacetime, -1.f, 1.f, patchState_->modAttenuverters, patchState_->cvAttenuverters);
         SetSpacetime(t);
 
-        float r = 1.f - reverse_;
-        float x = 0;
+        forward_ = 1.f - reverse_;
 
-        ParameterInterpolator volParam = ParameterInterpolator(&dryWet_, patchCtrls_->ambienceVol, size);
+        // The diffusers crossfade from their old to their new delay times over the block
+        x_ = 0;
+
+        // Volume ramps to its new value over the block
+        volInc_ = (patchCtrls_->ambienceVol - dryWet_) / static_cast<float>(size);
+    }
+
+    // One stereo sample, in place
+    inline void processSample(float &leftIO, float &rightIO)
+    {
+        float lIn = Clamp(leftIO, -3.f, 3.f);
+        float rIn = Clamp(rightIO, -3.f, 3.f);
+
+        float left = reversers_[LEFT_CHANNEL]->LastOut() * reverse_ + lIn * forward_;
+        float right = reversers_[RIGHT_CHANNEL]->LastOut() * reverse_ + rIn * forward_;
+
+        reversers_[LEFT_CHANNEL]->Process(lIn);
+        reversers_[RIGHT_CHANNEL]->Process(rIn);
+
+        float leftFb = dampFilters_[LEFT_CHANNEL]->Process(left + diffusers_[RIGHT_CHANNEL]->GetFbOut());
+        float rightFb = dampFilters_[RIGHT_CHANNEL]->Process(right + diffusers_[LEFT_CHANNEL]->GetFbOut());
+
+        leftFb = HardClip(left * (1.f - pan_) + leftFb);
+        rightFb = HardClip(right * pan_ + rightFb);
+
+        leftFb *= 1.f - ef_[LEFT_CHANNEL]->process(leftFb);
+        rightFb *= 1.f - ef_[RIGHT_CHANNEL]->process(rightFb);
+
+        leftFb = dc_[LEFT_CHANNEL]->process(leftFb);
+        rightFb = dc_[RIGHT_CHANNEL]->process(rightFb);
+
+        left = diffusers_[LEFT_CHANNEL]->Process(leftFb, x_);
+        right = diffusers_[RIGHT_CHANNEL]->Process(rightFb, x_);
+
+        x_ += xi_;
+
+        float a = Map(decay_, 0.f, 1.f, amp_ * 1.3f, amp_);
+
+        left = comp_[LEFT_CHANNEL]->process(left * a) * kAmbienceMakeupGain;
+        right = comp_[RIGHT_CHANNEL]->process(right * a) * kAmbienceMakeupGain;
+
+        dryWet_ += volInc_;
+        float v = dryWet_;
+
+        leftIO = CheapEqualPowerCrossFade(lIn, left, v, 1.4f);
+        rightIO = CheapEqualPowerCrossFade(rIn, right, v, 1.4f);
+    }
+
+    // Call once per block, after the block's last processSample()
+    void finish()
+    {
+        diffusers_[LEFT_CHANNEL]->UpdateDelayTimes();
+        diffusers_[RIGHT_CHANNEL]->UpdateDelayTimes();
+    }
+
+    void process(AudioBuffer &input, AudioBuffer &output)
+    {
+        size_t size = output.getSize();
+        FloatArray leftIn = input.getSamples(LEFT_CHANNEL);
+        FloatArray rightIn = input.getSamples(RIGHT_CHANNEL);
+        FloatArray leftOut = output.getSamples(LEFT_CHANNEL);
+        FloatArray rightOut = output.getSamples(RIGHT_CHANNEL);
+
+        prepare(size);
 
         for (size_t i = 0; i < size; i++)
         {
-            float lIn = Clamp(leftIn[i], -3.f, 3.f);
-            float rIn = Clamp(rightIn[i], -3.f, 3.f);
-
-            float left = reversers_[LEFT_CHANNEL]->LastOut() * reverse_ + lIn * r;
-            float right = reversers_[RIGHT_CHANNEL]->LastOut() * reverse_ + rIn * r;
-
-            reversers_[LEFT_CHANNEL]->Process(lIn);
-            reversers_[RIGHT_CHANNEL]->Process(rIn);
-
-            float leftFb = dampFilters_[LEFT_CHANNEL]->Process(left + diffusers_[RIGHT_CHANNEL]->GetFbOut());
-            float rightFb = dampFilters_[RIGHT_CHANNEL]->Process(right + diffusers_[LEFT_CHANNEL]->GetFbOut());
-
-            leftFb = HardClip(left * (1.f - pan_) + leftFb);
-            rightFb = HardClip(right * pan_ + rightFb);
-
-            leftFb *= 1.f - ef_[LEFT_CHANNEL]->process(leftFb);
-            rightFb *= 1.f - ef_[RIGHT_CHANNEL]->process(rightFb);
-
-            leftFb = dc_[LEFT_CHANNEL]->process(leftFb);
-            rightFb = dc_[RIGHT_CHANNEL]->process(rightFb);
-
-            left = diffusers_[LEFT_CHANNEL]->Process(leftFb, x);
-            right = diffusers_[RIGHT_CHANNEL]->Process(rightFb, x);
-
-            x += xi_;
-
-            float a = Map(decay_, 0.f, 1.f, amp_ * 1.3f, amp_);
-
-            left = comp_[LEFT_CHANNEL]->process(left * a) * kAmbienceMakeupGain;
-            right = comp_[RIGHT_CHANNEL]->process(right * a) * kAmbienceMakeupGain;
-
-            float v = volParam.Next();
-
-            leftOut[i] = CheapEqualPowerCrossFade(lIn, left, v, 1.4f);
-            rightOut[i] = CheapEqualPowerCrossFade(rIn, right, v, 1.4f);
+            float left = leftIn[i];
+            float right = rightIn[i];
+            processSample(left, right);
+            leftOut[i] = left;
+            rightOut[i] = right;
         }
 
-        diffusers_[LEFT_CHANNEL]->UpdateDelayTimes();
-        diffusers_[RIGHT_CHANNEL]->UpdateDelayTimes();
+        finish();
     }
 };

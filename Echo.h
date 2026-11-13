@@ -40,6 +40,11 @@ private:
     float repeats_, filterValue_, dryWet_;
     float xi_;
 
+    // Per-block state, set by prepare()
+    float density_ = 0.f;
+    float x_ = 0.f;
+    float volInc_ = 0.f;
+
     bool externalClock_;
     bool infinite_;
 
@@ -206,6 +211,101 @@ public:
         delete obj;
     }
 
+    // Control-rate work: call once per block of `size` samples, before processSample()
+    void prepare(size_t size)
+    {
+        SetFilter(patchCtrls_->echoFilter);
+
+        density_ = Modulate(patchCtrls_->echoDensity, patchCtrls_->echoDensityModAmount, patchState_->modValue, patchCtrls_->echoDensityCvAmount, patchCvs_->echoDensity, -1.f, 1.f, patchState_->modAttenuverters, patchState_->cvAttenuverters);
+        if (externalClock_)
+        {
+            SetDensity(density_);
+        }
+
+        float r = Modulate(patchCtrls_->echoRepeats, patchCtrls_->echoRepeatsModAmount, patchState_->modValue, patchCtrls_->echoRepeatsCvAmount, patchCvs_->echoRepeats, -1.f, 1.f, patchState_->modAttenuverters, patchState_->cvAttenuverters);
+        SetRepeats(r);
+
+        // The tap times crossfade from the old to the new ones over the block
+        x_ = 0;
+
+        // Volume ramps to its new value over the block
+        volInc_ = (patchCtrls_->echoVol - dryWet_) / static_cast<float>(size);
+    }
+
+    // One stereo sample, in place
+    inline void processSample(float &leftIO, float &rightIO)
+    {
+        // Using crossfade between two different tap times when the clock is
+        // external and a filtered density param for when the clock is
+        // internal (for pitch shifting effect).
+        if (externalClock_)
+        {
+            outs_[TAP_LEFT_A] = lines_[TAP_LEFT_A]->read(tapsTimes_[TAP_LEFT_A], newTapsTimes_[TAP_LEFT_A], x_); // A
+            outs_[TAP_LEFT_B] = lines_[TAP_LEFT_B]->read(tapsTimes_[TAP_LEFT_B], newTapsTimes_[TAP_LEFT_B], x_); // B
+            outs_[TAP_RIGHT_A] = lines_[TAP_RIGHT_A]->read(tapsTimes_[TAP_RIGHT_A], newTapsTimes_[TAP_RIGHT_A], x_); // A
+            outs_[TAP_RIGHT_B] = lines_[TAP_RIGHT_B]->read(tapsTimes_[TAP_RIGHT_B], newTapsTimes_[TAP_RIGHT_B], x_); // B
+
+            x_ += xi_;
+        }
+        else
+        {
+            SetDensity(density_);
+            outs_[TAP_LEFT_A] = lines_[TAP_LEFT_A]->read(newTapsTimes_[TAP_LEFT_A]); // A
+            outs_[TAP_LEFT_B] = lines_[TAP_LEFT_B]->read(newTapsTimes_[TAP_LEFT_B]); // B
+            outs_[TAP_RIGHT_A] = lines_[TAP_RIGHT_A]->read(newTapsTimes_[TAP_RIGHT_A]); // A
+            outs_[TAP_RIGHT_B] = lines_[TAP_RIGHT_B]->read(newTapsTimes_[TAP_RIGHT_B]); // B
+        }
+
+        float leftFb = HardClip(outs_[TAP_LEFT_A] * levels_[TAP_LEFT_A] + outs_[TAP_RIGHT_A] * levels_[TAP_RIGHT_A]);
+        float rightFb = HardClip(outs_[TAP_LEFT_B] * levels_[TAP_LEFT_B] + outs_[TAP_RIGHT_B] * levels_[TAP_RIGHT_B]);
+
+        float lIn = Clamp(leftIO, -3.f, 3.f);
+        float rIn = Clamp(rightIO, -3.f, 3.f);
+
+        float leftFilter;
+        float rightFilter;
+
+        filter_->Process(lIn, rIn, leftFilter, rightFilter);
+
+        leftFb += leftFilter;
+        rightFb += rightFilter;
+
+        if (infinite_)
+        {
+            leftFb *= repeats_ * kEchoInfiniteFeedbackLevel - ef_[LEFT_CHANNEL]->process(leftFb);
+            rightFb *= repeats_* kEchoInfiniteFeedbackLevel - ef_[RIGHT_CHANNEL]->process(rightFb);
+        }
+
+        lines_[TAP_LEFT_A]->write(leftFb);
+        lines_[TAP_LEFT_B]->write(leftFb);
+        lines_[TAP_RIGHT_A]->write(rightFb);
+        lines_[TAP_RIGHT_B]->write(rightFb);
+
+        float left = Mix2(outs_[TAP_LEFT_A], outs_[TAP_LEFT_B]);
+        float right = Mix2(outs_[TAP_RIGHT_A], outs_[TAP_RIGHT_B]);
+
+        left = comp_[LEFT_CHANNEL]->process(left) * kEchoMakeupGain;
+        right = comp_[RIGHT_CHANNEL]->process(right) * kEchoMakeupGain;
+
+        dryWet_ += volInc_;
+        float v = dryWet_;
+
+        leftIO = CheapEqualPowerCrossFade(lIn, left, v);
+        rightIO = CheapEqualPowerCrossFade(rIn, right, v);
+    }
+
+    // Call once per block, after the block's last processSample()
+    void finish()
+    {
+        if (externalClock_)
+        {
+            for (size_t j = 0; j < kEchoTaps; j++)
+            {
+                tapsTimes_[j] = newTapsTimes_[j];
+            }
+        }
+    }
+
     void process(AudioBuffer &input, AudioBuffer &output)
     {
         size_t size = output.getSize();
@@ -214,87 +314,17 @@ public:
         FloatArray leftOut = output.getSamples(LEFT_CHANNEL);
         FloatArray rightOut = output.getSamples(RIGHT_CHANNEL);
 
-        SetFilter(patchCtrls_->echoFilter);
-
-        float d = Modulate(patchCtrls_->echoDensity, patchCtrls_->echoDensityModAmount, patchState_->modValue, patchCtrls_->echoDensityCvAmount, patchCvs_->echoDensity, -1.f, 1.f, patchState_->modAttenuverters, patchState_->cvAttenuverters);
-        if (externalClock_)
-        {
-            SetDensity(d);
-        }
-
-        float r = Modulate(patchCtrls_->echoRepeats, patchCtrls_->echoRepeatsModAmount, patchState_->modValue, patchCtrls_->echoRepeatsCvAmount, patchCvs_->echoRepeats, -1.f, 1.f, patchState_->modAttenuverters, patchState_->cvAttenuverters);
-        SetRepeats(r);
-
-        float x = 0;
-
-        ParameterInterpolator volParam = ParameterInterpolator(&dryWet_, patchCtrls_->echoVol, size);
+        prepare(size);
 
         for (size_t i = 0; i < size; i++)
         {
-            // Using crossfade between two different tap times when the clock is
-            // external and a filtered density param for when the clock is
-            // internal (for pitch shifting effect).
-            if (externalClock_)
-            {
-                outs_[TAP_LEFT_A] = lines_[TAP_LEFT_A]->read(tapsTimes_[TAP_LEFT_A], newTapsTimes_[TAP_LEFT_A], x); // A
-                outs_[TAP_LEFT_B] = lines_[TAP_LEFT_B]->read(tapsTimes_[TAP_LEFT_B], newTapsTimes_[TAP_LEFT_B], x); // B
-                outs_[TAP_RIGHT_A] = lines_[TAP_RIGHT_A]->read(tapsTimes_[TAP_RIGHT_A], newTapsTimes_[TAP_RIGHT_A], x); // A
-                outs_[TAP_RIGHT_B] = lines_[TAP_RIGHT_B]->read(tapsTimes_[TAP_RIGHT_B], newTapsTimes_[TAP_RIGHT_B], x); // B
-
-                x += xi_;
-            }
-            else
-            {
-                SetDensity(d);
-                outs_[TAP_LEFT_A] = lines_[TAP_LEFT_A]->read(newTapsTimes_[TAP_LEFT_A]); // A
-                outs_[TAP_LEFT_B] = lines_[TAP_LEFT_B]->read(newTapsTimes_[TAP_LEFT_B]); // B
-                outs_[TAP_RIGHT_A] = lines_[TAP_RIGHT_A]->read(newTapsTimes_[TAP_RIGHT_A]); // A
-                outs_[TAP_RIGHT_B] = lines_[TAP_RIGHT_B]->read(newTapsTimes_[TAP_RIGHT_B]); // B
-            }
-
-            float leftFb = HardClip(outs_[TAP_LEFT_A] * levels_[TAP_LEFT_A] + outs_[TAP_RIGHT_A] * levels_[TAP_RIGHT_A]);
-            float rightFb = HardClip(outs_[TAP_LEFT_B] * levels_[TAP_LEFT_B] + outs_[TAP_RIGHT_B] * levels_[TAP_RIGHT_B]);
-
-            float lIn = Clamp(leftIn[i], -3.f, 3.f);
-            float rIn = Clamp(rightIn[i], -3.f, 3.f);
-
-            float leftFilter;
-            float rightFilter;
-
-            filter_->Process(lIn, rIn, leftFilter, rightFilter);
-
-            leftFb += leftFilter;
-            rightFb += rightFilter;
-
-            if (infinite_)
-            {
-                leftFb *= repeats_ * kEchoInfiniteFeedbackLevel - ef_[LEFT_CHANNEL]->process(leftFb);
-                rightFb *= repeats_* kEchoInfiniteFeedbackLevel - ef_[RIGHT_CHANNEL]->process(rightFb);
-            }
-            
-            lines_[TAP_LEFT_A]->write(leftFb);
-            lines_[TAP_LEFT_B]->write(leftFb);
-            lines_[TAP_RIGHT_A]->write(rightFb);
-            lines_[TAP_RIGHT_B]->write(rightFb);
-
-            float left = Mix2(outs_[TAP_LEFT_A], outs_[TAP_LEFT_B]);
-            float right = Mix2(outs_[TAP_RIGHT_A], outs_[TAP_RIGHT_B]);
-
-            left = comp_[LEFT_CHANNEL]->process(left) * kEchoMakeupGain;
-            right = comp_[RIGHT_CHANNEL]->process(right) * kEchoMakeupGain;
-
-            float v = volParam.Next();
-
-            leftOut[i] = CheapEqualPowerCrossFade(lIn, left, v);
-            rightOut[i] = CheapEqualPowerCrossFade(rIn, right, v);
+            float left = leftIn[i];
+            float right = rightIn[i];
+            processSample(left, right);
+            leftOut[i] = left;
+            rightOut[i] = right;
         }
 
-        if (externalClock_)
-        {
-            for (size_t j = 0; j < kEchoTaps; j++)
-            {
-                tapsTimes_[j] = newTapsTimes_[j];
-            }
-        }
+        finish();
     }
 };

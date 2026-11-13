@@ -51,6 +51,25 @@ public:
         iroi_->Process(buffer);
     }
 
+    // Per-sample alternative to processAudio(): each block is beginBlock(), then
+    // getBlockSize() calls to processSample(), then endBlock()
+    void beginBlock()
+    {
+        ui_->Poll();
+        clock_->Process();
+        iroi_->BeginBlock();
+    }
+
+    inline void processSample(float &left, float &right)
+    {
+        iroi_->ProcessSample(left, right);
+    }
+
+    void endBlock()
+    {
+        iroi_->EndBlock();
+    }
+
 
     void updateSampleRateBlockSize(float newSampleRate, int blockSize) 
     {

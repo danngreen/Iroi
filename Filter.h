@@ -194,6 +194,8 @@ private:
 
     float drive_;
     float cutoff_;
+    float cutoffInc_ = 0.f;
+    float volInc_ = 0.f;
     float reso_, resoValue_;
     float amp_;
     float filterGain_;
@@ -338,15 +340,9 @@ public:
         delete obj;
     }
 
-    void process(AudioBuffer &input, AudioBuffer &output)
+    // Control-rate work: call once per block of `size` samples, before processSample()
+    void prepare(size_t size)
     {
-        size_t size = output.getSize();
-
-        FloatArray leftIn = input.getSamples(LEFT_CHANNEL);
-        FloatArray rightIn = input.getSamples(RIGHT_CHANNEL);
-        FloatArray leftOut = output.getSamples(LEFT_CHANNEL);
-        FloatArray rightOut = output.getSamples(RIGHT_CHANNEL);
-
         SetMode(patchCtrls_->filterMode);
         if (mode_ != lastMode_)
         {
@@ -361,44 +357,69 @@ public:
         float r = Modulate(patchCtrls_->filterResonance, patchCtrls_->filterResonanceModAmount, patchState_->modValue, patchCtrls_->filterResonanceCvAmount, patchCvs_->filterResonance, -1.f, 1.f, patchState_->modAttenuverters, patchState_->cvAttenuverters);
         SetReso(r);
 
-        ParameterInterpolator cutoffParam = ParameterInterpolator(&cutoff_, patchCtrls_->filterCutoff, size);
-        ParameterInterpolator volParam = ParameterInterpolator(&dryWet_, patchCtrls_->filterVol, size);
+        // Cutoff and volume ramp to their new values over the block
+        cutoffInc_ = (patchCtrls_->filterCutoff - cutoff_) / static_cast<float>(size);
+        volInc_ = (patchCtrls_->filterVol - dryWet_) / static_cast<float>(size);
+    }
+
+    // One stereo sample, in place
+    inline void processSample(float &left, float &right)
+    {
+        cutoff_ += cutoffInc_;
+        SetNote(cutoff_);
+
+        float n = noise_.Process() * noiseLevel_;
+
+        float lIn = Clamp(left, -3.f, 3.f);
+        float rIn = Clamp(right, -3.f, 3.f);
+
+        float ls = SoftClip(lIn * amp_ + n);
+        float rs = SoftClip(rIn * amp_ + n);
+
+        float lf = LinearCrossFade(lIn + n, ls, drive_);
+        float rf = LinearCrossFade(rIn + n, rs, drive_);
+
+        float lo = lf, ro = rf;
+        if (FilterMode::CF == mode_)
+        {
+            lo = SoftClip(combs_[LEFT_CHANNEL]->Process(lf) * filterGain_);
+            ro = SoftClip(combs_[RIGHT_CHANNEL]->Process(rf) * filterGain_);
+            lo = dc_[LEFT_CHANNEL]->process(lo);
+            ro = dc_[RIGHT_CHANNEL]->process(ro);
+        }
+        else
+        {
+            lo = SoftClip(filters_[LEFT_CHANNEL]->process(lf) * filterGain_);
+            ro = SoftClip(filters_[RIGHT_CHANNEL]->process(rf) * filterGain_);
+            lo *= 1.f - ef_[LEFT_CHANNEL]->process(lo);
+            ro *= 1.f - ef_[RIGHT_CHANNEL]->process(ro);
+        }
+
+        dryWet_ += volInc_;
+        float v = dryWet_;
+
+        left = SoftClip(lo * kFilterMakeupGain * v);
+        right = SoftClip(ro * kFilterMakeupGain * v);
+    }
+
+    void process(AudioBuffer &input, AudioBuffer &output)
+    {
+        size_t size = output.getSize();
+
+        FloatArray leftIn = input.getSamples(LEFT_CHANNEL);
+        FloatArray rightIn = input.getSamples(RIGHT_CHANNEL);
+        FloatArray leftOut = output.getSamples(LEFT_CHANNEL);
+        FloatArray rightOut = output.getSamples(RIGHT_CHANNEL);
+
+        prepare(size);
 
         for (size_t i = 0; i < size; i++)
         {
-            SetNote(cutoffParam.Next());
-
-            float n = noise_.Process() * noiseLevel_;
-
-            float lIn = Clamp(leftIn[i], -3.f, 3.f);
-            float rIn = Clamp(rightIn[i], -3.f, 3.f);
-
-            float ls = SoftClip(lIn * amp_ + n);
-            float rs = SoftClip(rIn * amp_ + n);
-
-            float lf = LinearCrossFade(lIn + n, ls, drive_);
-            float rf = LinearCrossFade(rIn + n, rs, drive_);
-
-            float lo = lf, ro = rf;
-            if (FilterMode::CF == mode_)
-            {
-                lo = SoftClip(combs_[LEFT_CHANNEL]->Process(lf) * filterGain_);
-                ro = SoftClip(combs_[RIGHT_CHANNEL]->Process(rf) * filterGain_);
-                lo = dc_[LEFT_CHANNEL]->process(lo);
-                ro = dc_[RIGHT_CHANNEL]->process(ro);
-            }
-            else
-            {
-                lo = SoftClip(filters_[LEFT_CHANNEL]->process(lf) * filterGain_);
-                ro = SoftClip(filters_[RIGHT_CHANNEL]->process(rf) * filterGain_);
-                lo *= 1.f - ef_[LEFT_CHANNEL]->process(lo);
-                ro *= 1.f - ef_[RIGHT_CHANNEL]->process(ro);
-            }
-
-            float v = volParam.Next();
-
-            leftOut[i] = SoftClip(lo * kFilterMakeupGain * v);
-            rightOut[i] = SoftClip(ro * kFilterMakeupGain * v);
+            float left = leftIn[i];
+            float right = rightIn[i];
+            processSample(left, right);
+            leftOut[i] = left;
+            rightOut[i] = right;
         }
     }
 };
